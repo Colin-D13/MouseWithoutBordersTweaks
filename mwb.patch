@@ -1,0 +1,1448 @@
+diff --git a/src/modules/MouseWithoutBorders/App/Class/InputHook.cs b/src/modules/MouseWithoutBorders/App/Class/InputHook.cs
+index 53e815c..f853ac2 100644
+--- a/src/modules/MouseWithoutBorders/App/Class/InputHook.cs
++++ b/src/modules/MouseWithoutBorders/App/Class/InputHook.cs
+@@ -1,4 +1,4 @@
+-﻿// Copyright (c) Microsoft Corporation
++// Copyright (c) Microsoft Corporation
+ // The Microsoft Corporation licenses this file to you under the MIT license.
+ // See the LICENSE file in the project root for more information.
+ 
+@@ -67,6 +67,11 @@ namespace MouseWithoutBorders.Class
+ 
+         internal event KeybdEvHandler KeyboardEvent;
+ 
++        private const int LLMHF_INJECTED = 0x01;
++
++        private static long lastRemoteMouseTicks;
++        private static long lastPhysicalInputTicks;
++
+         private int hMouseHook;
+         private int hKeyboardHook;
+         private static NativeMethods.HookProc mouseHookProcedure;
+@@ -202,6 +207,37 @@ namespace MouseWithoutBorders.Class
+             }
+         }
+ 
++        // Mouse input injected by other programs (not by MWB, whose own input is flagged with RealData = false),
++        // such as Parsec or other remote-desktop apps. IgnoreRemoteInput=0 in settings.ini turns this off.
++        private static bool IsRemoteMouse(IntPtr lParam)
++        {
++            bool injected = (LParamToMouseLLHookStruct(lParam).Flags & LLMHF_INJECTED) != 0;
++
++            if (!injected || Tweaks.Get("IgnoreRemoteInput", 1) == 0)
++            {
++                lastPhysicalInputTicks = Environment.TickCount64;
++                return false;
++            }
++
++            lastRemoteMouseTicks = Environment.TickCount64;
++            return true;
++        }
++
++        // Injected keys are left to this PC only while a remote app is driving it (its mouse input is newer than any
++        // physical input here), so keys injected by e.g. Stream Deck hotkeys still go to the machine being controlled.
++        private static bool IsRemoteKey(IntPtr lParam)
++        {
++            bool injected = (LParamToKeyboardHookStruct(lParam).Flags & (int)WM.LLKHF.INJECTED) != 0;
++
++            if (!injected)
++            {
++                lastPhysicalInputTicks = Environment.TickCount64;
++                return false;
++            }
++
++            return lastRemoteMouseTicks > lastPhysicalInputTicks && Tweaks.Get("IgnoreRemoteInput", 1) != 0;
++        }
++
+         private int MouseHookProc(int nCode, int wParam, IntPtr lParam)
+         {
+             int rv = 1, dx = 0, dy = 0;
+@@ -218,6 +254,12 @@ namespace MouseWithoutBorders.Class
+                     // return rv;
+                     rv = NativeMethods.CallNextHookEx(hMouseHook, nCode, wParam, lParam);
+                 }
++                else if (nCode >= 0 && IsRemoteMouse(lParam))
++                {
++                    // Injected by another program, e.g. Parsec driving this PC from another device: it's meant for this PC,
++                    // so let it through, and never forward it to another machine or switch machines with it.
++                    rv = NativeMethods.CallNextHookEx(hMouseHook, nCode, wParam, lParam);
++                }
+                 else
+                 {
+                     Event.RealInputEventCount++;
+@@ -337,7 +379,7 @@ namespace MouseWithoutBorders.Class
+         private int KeyboardHookProc(int nCode, int wParam, IntPtr lParam)
+         {
+             Event.InputEventCount++;
+-            if (!RealData)
++            if (!RealData || (nCode >= 0 && IsRemoteKey(lParam)))
+             {
+                 return NativeMethods.CallNextHookEx(hKeyboardHook, nCode, wParam, lParam);
+             }
+diff --git a/src/modules/MouseWithoutBorders/App/Class/NativeMethods.cs b/src/modules/MouseWithoutBorders/App/Class/NativeMethods.cs
+index 831144f..47022bd 100644
+--- a/src/modules/MouseWithoutBorders/App/Class/NativeMethods.cs
++++ b/src/modules/MouseWithoutBorders/App/Class/NativeMethods.cs
+@@ -309,6 +309,11 @@ namespace MouseWithoutBorders.Class
+         [LibraryImport("shell32.dll", SetLastError = true)]
+         internal static partial int SHQueryUserNotificationState(out USER_NOTIFICATION_STATE state);
+ 
++        internal const uint MONITOR_DEFAULTTONULL = 0;
++
++        [LibraryImport("user32.dll")]
++        internal static partial IntPtr MonitorFromPoint(POINT pt, uint dwFlags);
++
+         [StructLayout(LayoutKind.Sequential)]
+         internal struct POINT
+         {
+diff --git a/src/modules/MouseWithoutBorders/App/Core/EdgePush.cs b/src/modules/MouseWithoutBorders/App/Core/EdgePush.cs
+new file mode 100644
+index 0000000..5e3b7eb
+--- /dev/null
++++ b/src/modules/MouseWithoutBorders/App/Core/EdgePush.cs
+@@ -0,0 +1,310 @@
++// Copyright (c) Microsoft Corporation
++// The Microsoft Corporation licenses this file to you under the MIT license.
++// See the LICENSE file in the project root for more information.
++
++using System;
++using System.Diagnostics;
++using System.Text;
++
++// <summary>
++//     Edge resistance for Easy Mouse: the cursor only switches machines when it's moved into a screen edge hard enough.
++//     Settings (%LOCALAPPDATA%\mwb8k\settings.ini, speeds in pixels per second):
++//       EdgeFlickSpeed:  dragging into the edge, measured from the cursor on arrival and from raw input
++//                        while the push carries on without a pause (0 = switch on touch).
++//       EdgePushSpeed:   pushing after the cursor has rested on the border (raw input, see RawPush).
++//       EdgePushRestMs:  how long the cursor has to rest on the border, without pushing, before EdgePushSpeed applies.
++// </summary>
++namespace MouseWithoutBorders.Core;
++
++internal enum EdgeDirection
++{
++    Left,
++    Right,
++    Up,
++    Down,
++}
++
++internal static class EdgePush
++{
++    private const int DefaultFlickSpeed = 2500;
++    private const int DefaultPushSpeed = 1200;
++    private const int DefaultRestMs = 100;
++    private const int Capacity = 4096;
++
++    // Movement toward the edge below this still counts as resting on the border.
++    private const double RestSpeed = 100;
++
++    // Speeds are measured over the last 20 ms.
++    private static readonly long WindowTicks = Stopwatch.Frequency / 50;
++
++    private static readonly object SyncLock = new();
++    private static readonly long[] Ticks = new long[Capacity];
++    private static readonly int[] Xs = new int[Capacity];
++    private static readonly int[] Ys = new int[Capacity];
++
++    private static int head;
++    private static int count;
++
++    // The edge being watched, and since when the cursor has been on it without leaving (0 = not on it).
++    private static bool tracking;
++    private static EdgeDirection trackEdge;
++    private static int trackAt;
++    private static long borderSince;
++
++    // Latched once the cursor has rested on the watched edge, until it moves off it.
++    private static bool resting;
++
++    private static long lastLogTicks;
++
++    internal static void Record(int x, int y)
++    {
++        lock (SyncLock)
++        {
++            long now = Stopwatch.GetTimestamp();
++            Ticks[head] = now;
++            Xs[head] = x;
++            Ys[head] = y;
++            head = (head + 1) % Capacity;
++
++            if (count < Capacity)
++            {
++                count++;
++            }
++
++            if (tracking)
++            {
++                if (!OnBorder(trackEdge, trackAt, x, y))
++                {
++                    borderSince = 0;
++                    resting = false;
++                }
++                else if (borderSince == 0)
++                {
++                    borderSince = now;
++                }
++            }
++        }
++    }
++
++    // Positions before a machine switch are in a different coordinate space.
++    internal static void Reset()
++    {
++        lock (SyncLock)
++        {
++            count = 0;
++            tracking = false;
++            borderSince = 0;
++            resting = false;
++        }
++    }
++
++    internal static bool TryGetLatest(out int x, out int y)
++    {
++        lock (SyncLock)
++        {
++            int last = (head - 1 + Capacity) % Capacity;
++            x = Xs[last];
++            y = Ys[last];
++            return count > 0;
++        }
++    }
++
++    // edgeAt: the cursor is on the edge at x/y < edgeAt (Left/Up) or >= edgeAt (Right/Down).
++    internal static bool IsFastEnough(EdgeDirection edge, int edgeAt)
++    {
++        int flickSpeed = Tweaks.Get("EdgeFlickSpeed", DefaultFlickSpeed);
++
++        if (flickSpeed <= 0)
++        {
++            EdgeStats.Publish(EdgeStats.Drag, 0, 0);
++            return !EdgeStats.TestMode;
++        }
++
++        int pushSpeed = Math.Max(1, Tweaks.Get("EdgePushSpeed", DefaultPushSpeed));
++        long restTicks = Math.Max(0, Tweaks.Get("EdgePushRestMs", DefaultRestMs)) * Stopwatch.Frequency / 1000;
++
++        RawPush.Arm();
++
++        // A drag is the cursor arriving fast, or the raw push carrying on without a pause; once the cursor
++        // has rested on the border, the push is read from raw input (the cursor is stopped there).
++        double cursorSpeed = CursorSpeedToward(edge);
++        double rawSpeed = RawPush.SpeedToward(edge, WindowTicks);
++        bool fromBorder = cursorSpeed < flickSpeed && IsResting(edge, edgeAt, restTicks);
++        double speed = fromBorder ? rawSpeed : Math.Max(cursorSpeed, rawSpeed);
++        int needed = fromBorder ? pushSpeed : flickSpeed;
++
++        EdgeStats.Publish(fromBorder ? EdgeStats.Push : EdgeStats.Drag, speed, needed);
++
++        if (speed < needed)
++        {
++            return false;
++        }
++
++        LogDecision(edge, edgeAt, fromBorder, cursorSpeed, rawSpeed, needed, restTicks);
++
++        if (EdgeStats.TestMode)
++        {
++            // No switch happens in test mode, so start over as if it had: the cursor has to rest on the border again.
++            lock (SyncLock)
++            {
++                resting = false;
++                borderSince = borderSince == 0 ? 0 : Stopwatch.GetTimestamp();
++            }
++
++            return false;
++        }
++
++        return true;
++    }
++
++    // Hook positions can land past the edge while the cursor is pushed against it, so "on the border" is a range.
++    private static bool OnBorder(EdgeDirection edge, int edgeAt, int x, int y) => edge switch
++    {
++        EdgeDirection.Left => x < edgeAt,
++        EdgeDirection.Right => x >= edgeAt,
++        EdgeDirection.Up => y < edgeAt,
++        _ => y >= edgeAt,
++    };
++
++    // Cursor speed toward the edge over the 20 ms before the latest position, in pixels per second.
++    private static double CursorSpeedToward(EdgeDirection edge)
++    {
++        lock (SyncLock)
++        {
++            if (count < 2)
++            {
++                return 0;
++            }
++
++            int last = (head - 1 + Capacity) % Capacity;
++            int start = last;
++
++            // The newest sample at least a window older than the latest one, or the oldest we have.
++            for (int i = 1; i < count; i++)
++            {
++                start = (last - i + Capacity) % Capacity;
++
++                if (Ticks[last] - Ticks[start] >= WindowTicks)
++                {
++                    break;
++                }
++            }
++
++            long elapsed = Ticks[last] - Ticks[start];
++
++            // Too little history (e.g. right after a switch) to tell a flick from noise.
++            if (elapsed < WindowTicks / 2)
++            {
++                return 0;
++            }
++
++            int dx = Xs[last] - Xs[start];
++            int dy = Ys[last] - Ys[start];
++            int toward = edge switch
++            {
++                EdgeDirection.Left => -dx,
++                EdgeDirection.Right => dx,
++                EdgeDirection.Up => -dy,
++                _ => dy,
++            };
++
++            return toward * (double)Stopwatch.Frequency / elapsed;
++        }
++    }
++
++    // On the border: the cursor sat on this edge for restTicks before the current push window without being pushed
++    // into it. A drag that carries on into the edge never gets there, so it keeps needing EdgeFlickSpeed.
++    private static bool IsResting(EdgeDirection edge, int edgeAt, long restTicks)
++    {
++        lock (SyncLock)
++        {
++            if (count == 0)
++            {
++                return false;
++            }
++
++            Track(edge, edgeAt);
++
++            if (resting)
++            {
++                return true;
++            }
++
++            if (borderSince == 0 || borderSince > Stopwatch.GetTimestamp() - WindowTicks - restTicks)
++            {
++                return false;
++            }
++        }
++
++        if (!RawPush.WasStill(edge, WindowTicks, restTicks, RestSpeed))
++        {
++            return false;
++        }
++
++        lock (SyncLock)
++        {
++            resting = tracking && trackEdge == edge && trackAt == edgeAt && borderSince != 0;
++            return resting;
++        }
++    }
++
++    // Start watching an edge: find since when the cursor has been on it from the recent positions,
++    // after that Record keeps it up to date.
++    private static void Track(EdgeDirection edge, int edgeAt)
++    {
++        if (tracking && trackEdge == edge && trackAt == edgeAt)
++        {
++            return;
++        }
++
++        tracking = true;
++        trackEdge = edge;
++        trackAt = edgeAt;
++        resting = false;
++        borderSince = 0;
++
++        int last = (head - 1 + Capacity) % Capacity;
++
++        for (int i = 0; i < count; i++)
++        {
++            int idx = (last - i + Capacity) % Capacity;
++
++            if (!OnBorder(edge, edgeAt, Xs[idx], Ys[idx]))
++            {
++                break;
++            }
++
++            borderSince = Ticks[idx];
++        }
++    }
++
++    // Why a hit passed, for tuning: how long the cursor had been on the border and the recent positions.
++    private static void LogDecision(EdgeDirection edge, int edgeAt, bool fromBorder, double cursorSpeed, double rawSpeed, int needed, long restTicks)
++    {
++        long now = Stopwatch.GetTimestamp();
++
++        if (now - lastLogTicks < Stopwatch.Frequency / 3)
++        {
++            return;
++        }
++
++        lastLogTicks = now;
++        var recent = new StringBuilder();
++        double borderMs;
++
++        lock (SyncLock)
++        {
++            bool tracked = tracking && trackEdge == edge && trackAt == edgeAt;
++            borderMs = !tracked || borderSince == 0 ? 0 : (now - borderSince) * 1000.0 / Stopwatch.Frequency;
++            int last = (head - 1 + Capacity) % Capacity;
++
++            for (int i = 0; i < Math.Min(count, 6); i++)
++            {
++                int idx = (last - i + Capacity) % Capacity;
++                recent.Append($"{Xs[idx]},{Ys[idx]}@{(now - Ticks[idx]) * 1000.0 / Stopwatch.Frequency:F1} ");
++            }
++        }
++
++        Logger.Log($"EdgePush {edge} edgeAt={edgeAt}: {(fromBorder ? "PUSH" : "DRAG")} passes (needed {needed}) cursor={cursorSpeed:F0} raw={rawSpeed:F0} latched={resting} onBorderFor={borderMs:F0}ms restMs={restTicks * 1000 / Stopwatch.Frequency} {RawPush.Describe(edge, WindowTicks, restTicks)} recent(x,y@ms ago): {recent}");
++    }
++}
+diff --git a/src/modules/MouseWithoutBorders/App/Core/EdgeStats.cs b/src/modules/MouseWithoutBorders/App/Core/EdgeStats.cs
+new file mode 100644
+index 0000000..a3ff6d0
+--- /dev/null
++++ b/src/modules/MouseWithoutBorders/App/Core/EdgeStats.cs
+@@ -0,0 +1,103 @@
++// Copyright (c) Microsoft Corporation
++// The Microsoft Corporation licenses this file to you under the MIT license.
++// See the LICENSE file in the project root for more information.
++
++using System;
++using System.IO;
++using System.IO.MemoryMappedFiles;
++
++// <summary>
++//     Shares edge-switch measurements with the settings window (MwbSettings.exe) through shared memory, so it can show
++//     what MWB actually measured for a drag into the edge versus a push from the border. The window can also turn on a
++//     test mode, where edge hits are measured but never switch; it has to keep a heartbeat going for that to stay on.
++//     Layout (int32): 0 sequence, 4 last kind, 8 test-mode heartbeat (Environment.TickCount, 0 = off),
++//     then per kind (1 = drag into the edge, 2 = push from the border) at 16 + (kind - 1) * 16:
++//     peak speed of the latest attempt, speed needed, 1 if the peak would switch, Environment.TickCount of the last hit.
++// </summary>
++namespace MouseWithoutBorders.Core;
++
++internal static class EdgeStats
++{
++    internal const int Drag = 1;
++    internal const int Push = 2;
++
++    private const string MapName = "Local\\MwbEdgeStats";
++    private const int Size = 64;
++
++    // A new attempt starts after this long without a hit of the same kind.
++    private const int AttemptGapMs = 400;
++    private const int HeartbeatTimeoutMs = 1500;
++
++    private static readonly int[] Peak = new int[3];
++    private static readonly int[] LastHit = new int[3];
++
++    private static MemoryMappedFile map;
++    private static MemoryMappedViewAccessor view;
++    private static bool unavailable;
++    private static int sequence;
++
++    internal static bool TestMode
++    {
++        get
++        {
++            var v = View();
++
++            if (v == null)
++            {
++                return false;
++            }
++
++            int beat = v.ReadInt32(8);
++            return beat != 0 && unchecked(Environment.TickCount - beat) is >= 0 and < HeartbeatTimeoutMs;
++        }
++    }
++
++    internal static void Publish(int kind, double speed, int needed)
++    {
++        var v = View();
++
++        if (v == null)
++        {
++            return;
++        }
++
++        int now = Environment.TickCount;
++
++        if (unchecked(now - LastHit[kind]) > AttemptGapMs)
++        {
++            Peak[kind] = 0;
++        }
++
++        Peak[kind] = Math.Max(Peak[kind], (int)Math.Min(int.MaxValue, Math.Max(0, speed)));
++        LastHit[kind] = now;
++
++        int offset = 16 + ((kind - 1) * 16);
++        v.Write(offset, Peak[kind]);
++        v.Write(offset + 4, needed);
++        v.Write(offset + 8, Peak[kind] >= needed ? 1 : 0);
++        v.Write(offset + 12, now);
++        v.Write(4, kind);
++        v.Write(0, ++sequence);
++    }
++
++    private static MemoryMappedViewAccessor View()
++    {
++        if (view != null || unavailable)
++        {
++            return view;
++        }
++
++        try
++        {
++            map = MemoryMappedFile.CreateOrOpen(MapName, Size);
++            view = map.CreateViewAccessor(0, Size);
++        }
++        catch (Exception e) when (e is IOException || e is UnauthorizedAccessException)
++        {
++            Logger.Log(e);
++            unavailable = true;
++        }
++
++        return view;
++    }
++}
+diff --git a/src/modules/MouseWithoutBorders/App/Core/Event.cs b/src/modules/MouseWithoutBorders/App/Core/Event.cs
+index 659a155..892da89 100644
+--- a/src/modules/MouseWithoutBorders/App/Core/Event.cs
++++ b/src/modules/MouseWithoutBorders/App/Core/Event.cs
+@@ -67,12 +67,17 @@ internal static class Event
+         {
+             Common.PaintCount = 0;
+ 
++            if (e.dwFlags == WM.WM_MOUSEMOVE)
++            {
++                EdgePush.Record(e.X, e.Y);
++            }
++
+             // Check if easy mouse setting is enabled.
+             bool isEasyMouseEnabled = IsSwitchingByMouseEnabled();
+ 
+             if (isEasyMouseEnabled && Common.Sk != null && (Common.DesMachineID == Common.MachineID || !Setting.Values.MoveMouseRelatively) && e.dwFlags == WM.WM_MOUSEMOVE)
+             {
+-                Point p = MachineStuff.MoveToMyNeighbourIfNeeded(e.X, e.Y, MachineStuff.desMachineID);
++                Point p = MachineStuff.MoveToMyNeighbourIfNeeded(e.X, e.Y, MachineStuff.desMachineID, requirePush: true);
+ 
+                 // Check if easy mouse switches are disabled when an application is running in fullscreen mode,
+                 // if they are, check that there is no application running in fullscreen mode before switching.
+@@ -113,7 +118,7 @@ internal static class Event
+                     MousePackage.Md.Y = (e.Y - MachineStuff.primaryScreenBounds.Top) * 65535 / Common.screenHeight;
+                 }
+ 
+-                Common.SkSend(MousePackage, null, false);
++                MouseMoveCoalescer.Send(MousePackage);
+ 
+                 if (MousePackage.Md.dwFlags is WM.WM_LBUTTONUP or WM.WM_RBUTTONUP)
+                 {
+@@ -208,6 +213,10 @@ internal static class Event
+             {
+                 Logger.LogDebug("MouseEvent: Switching to new machine:" + newDesMachineName);
+ 
++                // Deliver the last coalesced move before the current machine is told to hide the cursor.
++                MouseMoveCoalescer.Flush();
++                EdgePush.Reset();
++
+                 // Ask current machine to hide the Mouse cursor
+                 if (newDesMachineID != ID.ALL && MachineStuff.desMachineID != Common.MachineID)
+                 {
+diff --git a/src/modules/MouseWithoutBorders/App/Core/MachineStuff.cs b/src/modules/MouseWithoutBorders/App/Core/MachineStuff.cs
+index add9a03..53d357e 100644
+--- a/src/modules/MouseWithoutBorders/App/Core/MachineStuff.cs
++++ b/src/modules/MouseWithoutBorders/App/Core/MachineStuff.cs
+@@ -200,7 +200,7 @@ internal static class MachineStuff
+      *      Else this method is called by A and the return point is calculated by A.
+      * */
+ 
+-    internal static Point MoveToMyNeighbourIfNeeded(int x, int y, ID desMachineID)
++    internal static Point MoveToMyNeighbourIfNeeded(int x, int y, ID desMachineID, bool requirePush = false)
+     {
+         newDesMachineIdEx = desMachineID;
+ 
+@@ -240,19 +240,39 @@ internal static class MachineStuff
+         {
+             if (x < desktopBounds.Left + SKIP_PIXELS)
+             {
+-                return MoveLeft(x, y);
++                return MoveIfPushed(EdgeDirection.Left, x, y, requirePush, desktopBounds.Left + SKIP_PIXELS);
+             }
+             else if (x >= desktopBounds.Right - SKIP_PIXELS)
+             {
+-                return MoveRight(x, y);
++                return MoveIfPushed(EdgeDirection.Right, x, y, requirePush, desktopBounds.Right - SKIP_PIXELS);
+             }
+             else if (y < desktopBounds.Top + SKIP_PIXELS)
+             {
+-                return MoveUp(x, y);
++                return MoveIfPushed(EdgeDirection.Up, x, y, requirePush, desktopBounds.Top + SKIP_PIXELS);
+             }
+             else if (y >= desktopBounds.Bottom - SKIP_PIXELS)
+             {
+-                return MoveDown(x, y);
++                return MoveIfPushed(EdgeDirection.Down, x, y, requirePush, desktopBounds.Bottom - SKIP_PIXELS);
++            }
++
++            /* The primary monitor (monitor 1) is the machine's main screen: its edges also switch machines
++             * where no other monitor adjoins them, even if other monitors stick out further.
++             * */
++            if (InPrimaryRows(y) && x < primaryScreenBounds.Left + SKIP_PIXELS && !IsOnAnyMonitor(primaryScreenBounds.Left - 1, y))
++            {
++                return MoveIfPushed(EdgeDirection.Left, x, y, requirePush, primaryScreenBounds.Left + SKIP_PIXELS);
++            }
++            else if (InPrimaryRows(y) && x >= primaryScreenBounds.Right - SKIP_PIXELS && !IsOnAnyMonitor(primaryScreenBounds.Right, y))
++            {
++                return MoveIfPushed(EdgeDirection.Right, x, y, requirePush, primaryScreenBounds.Right - SKIP_PIXELS);
++            }
++            else if (InPrimaryColumns(x) && y < primaryScreenBounds.Top + SKIP_PIXELS && !IsOnAnyMonitor(x, primaryScreenBounds.Top - 1))
++            {
++                return MoveIfPushed(EdgeDirection.Up, x, y, requirePush, primaryScreenBounds.Top + SKIP_PIXELS);
++            }
++            else if (InPrimaryColumns(x) && y >= primaryScreenBounds.Bottom - SKIP_PIXELS && !IsOnAnyMonitor(x, primaryScreenBounds.Bottom))
++            {
++                return MoveIfPushed(EdgeDirection.Down, x, y, requirePush, primaryScreenBounds.Bottom - SKIP_PIXELS);
+             }
+         }
+ 
+@@ -263,25 +283,68 @@ internal static class MachineStuff
+         {
+             if (x < primaryScreenBounds.Left + SKIP_PIXELS)
+             {
+-                return MoveLeft(x, y);
++                return MoveIfPushed(EdgeDirection.Left, x, y, requirePush, primaryScreenBounds.Left + SKIP_PIXELS);
+             }
+             else if (x >= primaryScreenBounds.Right - SKIP_PIXELS)
+             {
+-                return MoveRight(x, y);
++                return MoveIfPushed(EdgeDirection.Right, x, y, requirePush, primaryScreenBounds.Right - SKIP_PIXELS);
+             }
+             else if (y < primaryScreenBounds.Top + SKIP_PIXELS)
+             {
+-                return MoveUp(x, y);
++                return MoveIfPushed(EdgeDirection.Up, x, y, requirePush, primaryScreenBounds.Top + SKIP_PIXELS);
+             }
+             else if (y >= primaryScreenBounds.Bottom - SKIP_PIXELS)
+             {
+-                return MoveDown(x, y);
++                return MoveIfPushed(EdgeDirection.Down, x, y, requirePush, primaryScreenBounds.Bottom - SKIP_PIXELS);
+             }
+         }
+ 
+         return Point.Empty;
+     }
+ 
++    // With requirePush, the cursor has to hit the edge fast enough to switch (see EdgePush); a slow drift into it stays put.
++    // edgeAt is where the edge starts: the cursor is on it at x/y < edgeAt (Left/Up) or >= edgeAt (Right/Down).
++    private static Point MoveIfPushed(EdgeDirection edge, int x, int y, bool requirePush, int edgeAt)
++    {
++        if (requirePush && !EdgePush.IsFastEnough(edge, edgeAt))
++        {
++            return Point.Empty;
++        }
++
++        return edge switch
++        {
++            EdgeDirection.Left => MoveLeft(x, y),
++            EdgeDirection.Right => MoveRight(x, y),
++            EdgeDirection.Up => MoveUp(x, y),
++            _ => MoveDown(x, y),
++        };
++    }
++
++    private static bool InPrimaryRows(int y) => y >= primaryScreenBounds.Top && y < primaryScreenBounds.Bottom;
++
++    private static bool InPrimaryColumns(int x) => x >= primaryScreenBounds.Left && x < primaryScreenBounds.Right;
++
++    private static bool IsOnAnyMonitor(int x, int y)
++    {
++        return NativeMethods.MonitorFromPoint(new NativeMethods.POINT { x = x, y = y }, NativeMethods.MONITOR_DEFAULTTONULL) != IntPtr.Zero;
++    }
++
++    // Where the cursor lands when switching back to this machine: on the primary monitor, in pixels (Event.XY_BY_PIXEL encoded).
++    // y (or x) comes from the controller's virtual cursor, which is kept within the primary screen bounds.
++    private static Point PrimaryScreenPixel(int x, int y)
++    {
++        x = Math.Clamp(x, primaryScreenBounds.Left, primaryScreenBounds.Right - 1);
++        y = Math.Clamp(y, primaryScreenBounds.Top, primaryScreenBounds.Bottom - 1);
++        return new Point(Event.XY_BY_PIXEL + x, Event.XY_BY_PIXEL + y);
++    }
++
++    // Position on the next machine when leaving this one: scaled from the primary monitor when leaving from its edge, else from the whole desktop.
++    private static Point LocalExitValue(Func<MyRectangle, Point> edgePoint, bool fromPrimary)
++    {
++        MyRectangle bounds = fromPrimary ? primaryScreenBounds : desktopBounds;
++        return ConvertToUniversalValue(edgePoint(bounds), bounds);
++    }
++
+ #endif
+ 
+     [SuppressMessage("Microsoft.Maintainability", "CA1502:AvoidExcessiveComplexity", Justification = "Dotnet port with style preservation")]
+@@ -386,20 +449,18 @@ internal static class MachineStuff
+             {
+                 if (newDesMachineIdEx == Common.MachineID)
+                 {
+-                    /* Switching back to the controller machine, we need to scale up to the desktopBounds from primaryScreenBounds (sine !Setting.Values.MoveMouseRelatively).
+-                     * primaryScreenBounds => 65535 => desktopBounds, so that the Mouse position is mapped to the right position when the controller machine has multiple monitors.
++                    /* Switching back to the controller machine: land on its primary monitor (monitor 1).
+                      * */
+-                    return ConvertToUniversalValue(new Point(primaryScreenBounds.Left + JUMP_PIXELS, y), primaryScreenBounds);
++                    return PrimaryScreenPixel(primaryScreenBounds.Left + JUMP_PIXELS, y);
+                 }
+                 else
+                 {
+                     if (desMachineID == Common.MachineID)
+                     {
+                         /* Switching FROM the controller machine, since Mouse was not bounded/locked to the primary screen,
+-                         * Mouse position can just be mapped from desktopBounds to desktopBounds
+-                         * desktopBounds => 65535 => desktopBounds.
++                         * Mouse position is mapped from the primary monitor if it's on it, else from desktopBounds.
+                          * */
+-                        return ConvertToUniversalValue(new Point(desktopBounds.Left + JUMP_PIXELS, y), desktopBounds);
++                        return LocalExitValue(b => new Point(b.Left + JUMP_PIXELS, y), InPrimaryRows(y));
+                     }
+                     else
+                     {
+@@ -523,9 +584,9 @@ internal static class MachineStuff
+ 
+             return !Setting.Values.MoveMouseRelatively
+                 ? newDesMachineIdEx == Common.MachineID
+-                    ? ConvertToUniversalValue(new Point(primaryScreenBounds.Right - JUMP_PIXELS, y), primaryScreenBounds)
++                    ? PrimaryScreenPixel(primaryScreenBounds.Right - JUMP_PIXELS, y)
+                     : desMachineID == Common.MachineID
+-                        ? ConvertToUniversalValue(new Point(desktopBounds.Right - JUMP_PIXELS, y), desktopBounds)
++                        ? LocalExitValue(b => new Point(b.Right - JUMP_PIXELS, y), InPrimaryRows(y))
+                         : ConvertToUniversalValue(new Point(primaryScreenBounds.Right - JUMP_PIXELS, y), primaryScreenBounds)
+                 : ConvertToUniversalValue(new Point(desktopBounds.Right - JUMP_PIXELS, y), desktopBounds);
+         }
+@@ -592,9 +653,9 @@ internal static class MachineStuff
+ 
+             return !Setting.Values.MoveMouseRelatively
+                 ? newDesMachineIdEx == Common.MachineID
+-                    ? ConvertToUniversalValue(new Point(x, primaryScreenBounds.Bottom - JUMP_PIXELS), primaryScreenBounds)
++                    ? PrimaryScreenPixel(x, primaryScreenBounds.Bottom - JUMP_PIXELS)
+                     : desMachineID == Common.MachineID
+-                        ? ConvertToUniversalValue(new Point(x, desktopBounds.Bottom - JUMP_PIXELS), desktopBounds)
++                        ? LocalExitValue(b => new Point(x, b.Bottom - JUMP_PIXELS), InPrimaryColumns(x))
+                         : ConvertToUniversalValue(new Point(x, primaryScreenBounds.Bottom - JUMP_PIXELS), primaryScreenBounds)
+                 : ConvertToUniversalValue(new Point(x, desktopBounds.Bottom - JUMP_PIXELS), desktopBounds);
+         }
+@@ -662,9 +723,9 @@ internal static class MachineStuff
+ 
+             return !Setting.Values.MoveMouseRelatively
+                 ? newDesMachineIdEx == Common.MachineID
+-                    ? ConvertToUniversalValue(new Point(x, primaryScreenBounds.Top + JUMP_PIXELS), primaryScreenBounds)
++                    ? PrimaryScreenPixel(x, primaryScreenBounds.Top + JUMP_PIXELS)
+                     : desMachineID == Common.MachineID
+-                        ? ConvertToUniversalValue(new Point(x, desktopBounds.Top + JUMP_PIXELS), desktopBounds)
++                        ? LocalExitValue(b => new Point(x, b.Top + JUMP_PIXELS), InPrimaryColumns(x))
+                         : ConvertToUniversalValue(new Point(x, primaryScreenBounds.Top + JUMP_PIXELS), primaryScreenBounds)
+                 : ConvertToUniversalValue(new Point(x, desktopBounds.Top + JUMP_PIXELS), desktopBounds);
+         }
+diff --git a/src/modules/MouseWithoutBorders/App/Core/MouseMoveCoalescer.cs b/src/modules/MouseWithoutBorders/App/Core/MouseMoveCoalescer.cs
+new file mode 100644
+index 0000000..bb52cdb
+--- /dev/null
++++ b/src/modules/MouseWithoutBorders/App/Core/MouseMoveCoalescer.cs
+@@ -0,0 +1,204 @@
++// Copyright (c) Microsoft Corporation
++// The Microsoft Corporation licenses this file to you under the MIT license.
++// See the LICENSE file in the project root for more information.
++
++using System;
++using System.Diagnostics;
++using System.Runtime.InteropServices;
++using System.Threading;
++
++using MouseWithoutBorders.Class;
++
++// <summary>
++//     Caps the rate of mouse-move packages sent to the remote machine.
++//     High polling rate mice (4-8 kHz) otherwise produce one encrypted TCP package and one
++//     remote SendInput per report, which the remote machine can't keep up with, so moves
++//     queue up and the remote cursor lags by up to seconds.
++//     Absolute moves are coalesced to the latest position, relative moves are summed.
++//     Non-move events flush any pending move first so ordering is preserved.
++//     The rate is MaxMouseMoveHz in %LOCALAPPDATA%\mwb8k\settings.ini (default 500, 0 = disabled).
++// </summary>
++namespace MouseWithoutBorders.Core;
++
++internal static class MouseMoveCoalescer
++{
++    private const int DefaultMaxHz = 500;
++    private const uint CREATE_WAITABLE_TIMER_HIGH_RESOLUTION = 0x00000002;
++    private const uint TIMER_ALL_ACCESS = 0x1F0003;
++    private const uint INFINITE = 0xFFFFFFFF;
++
++    private static readonly object SendLock = new();
++    private static readonly DATA PendingMove = new();
++    private static readonly AutoResetEvent FlushSignal = new(false);
++
++    private static bool pendingValid;
++    private static bool pendingRelative;
++    private static long lastMoveSendTicks;
++    private static System.Threading.Thread flushThread;
++
++    internal static void Send(DATA package)
++    {
++        lock (SendLock)
++        {
++            if (MinIntervalTicks <= 0 || package.Md.dwFlags != WM.WM_MOUSEMOVE)
++            {
++                FlushLocked();
++                Common.SkSend(package, null, false);
++                return;
++            }
++
++            bool relative = IsRelative(package.Md);
++
++            if (pendingValid && (PendingMove.Des != package.Des || pendingRelative != relative))
++            {
++                FlushLocked();
++            }
++
++            if (pendingValid && relative)
++            {
++                PendingMove.Md.X = Encode(Decode(PendingMove.Md.X) + Decode(package.Md.X));
++                PendingMove.Md.Y = Encode(Decode(PendingMove.Md.Y) + Decode(package.Md.Y));
++            }
++            else
++            {
++                PendingMove.Des = package.Des;
++                PendingMove.Type = package.Type;
++                PendingMove.Md = package.Md;
++            }
++
++            pendingValid = true;
++            pendingRelative = relative;
++
++            if (Stopwatch.GetTimestamp() - lastMoveSendTicks >= MinIntervalTicks)
++            {
++                FlushLocked();
++            }
++            else
++            {
++                EnsureFlushThread();
++                _ = FlushSignal.Set();
++            }
++        }
++    }
++
++    // Sends the pending move now, e.g. before switching to another machine.
++    internal static void Flush()
++    {
++        lock (SendLock)
++        {
++            FlushLocked();
++        }
++    }
++
++    private static void FlushLocked()
++    {
++        if (!pendingValid)
++        {
++            return;
++        }
++
++        pendingValid = false;
++
++        // Drop moves meant for a machine we have already switched away from.
++        if (PendingMove.Des == MachineStuff.desMachineID)
++        {
++            Common.SkSend(PendingMove, null, false);
++            lastMoveSendTicks = Stopwatch.GetTimestamp();
++        }
++    }
++
++    private static void EnsureFlushThread()
++    {
++        if (flushThread != null)
++        {
++            return;
++        }
++
++        flushThread = new System.Threading.Thread(FlushLoop)
++        {
++            IsBackground = true,
++            Name = "MouseMoveCoalescer",
++            Priority = ThreadPriority.AboveNormal,
++        };
++        Thread.UpdateThreads(flushThread);
++        flushThread.Start();
++    }
++
++    private static void FlushLoop()
++    {
++        IntPtr timer = CreateWaitableTimerExW(IntPtr.Zero, null, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
++
++        while (true)
++        {
++            try
++            {
++                _ = FlushSignal.WaitOne();
++
++                long waitTicks;
++                lock (SendLock)
++                {
++                    if (!pendingValid)
++                    {
++                        continue;
++                    }
++
++                    waitTicks = lastMoveSendTicks + MinIntervalTicks - Stopwatch.GetTimestamp();
++                }
++
++                if (waitTicks > 0)
++                {
++                    SleepPrecise(timer, waitTicks);
++                }
++
++                Flush();
++            }
++            catch (Exception e)
++            {
++                Logger.Log(e);
++            }
++        }
++    }
++
++    private static void SleepPrecise(IntPtr timer, long stopwatchTicks)
++    {
++        // Relative due time in 100ns units is negative.
++        long dueTime = -Math.Max(1, stopwatchTicks * 10_000_000 / Stopwatch.Frequency);
++
++        if (timer != IntPtr.Zero && SetWaitableTimer(timer, ref dueTime, 0, IntPtr.Zero, IntPtr.Zero, false))
++        {
++            _ = WaitForSingleObject(timer, INFINITE);
++        }
++        else
++        {
++            Thread.Sleep(1);
++        }
++    }
++
++    private static bool IsRelative(MOUSEDATA md)
++    {
++        return Math.Abs(md.X) >= Event.MOVE_MOUSE_RELATIVE && Math.Abs(md.Y) >= Event.MOVE_MOUSE_RELATIVE;
++    }
++
++    private static int Decode(int v) => v < 0 ? v + Event.MOVE_MOUSE_RELATIVE : v - Event.MOVE_MOUSE_RELATIVE;
++
++    private static int Encode(int v) => v < 0 ? v - Event.MOVE_MOUSE_RELATIVE : v + Event.MOVE_MOUSE_RELATIVE;
++
++    private static long MinIntervalTicks
++    {
++        get
++        {
++            int hz = Tweaks.Get("MaxMouseMoveHz", DefaultMaxHz);
++            return hz <= 0 ? 0 : Stopwatch.Frequency / hz;
++        }
++    }
++
++    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
++    private static extern IntPtr CreateWaitableTimerExW(IntPtr lpTimerAttributes, string lpTimerName, uint dwFlags, uint dwDesiredAccess);
++
++    [DllImport("kernel32.dll", SetLastError = true)]
++    [return: MarshalAs(UnmanagedType.Bool)]
++    private static extern bool SetWaitableTimer(IntPtr hTimer, ref long pDueTime, int lPeriod, IntPtr pfnCompletionRoutine, IntPtr lpArgToCompletionRoutine, [MarshalAs(UnmanagedType.Bool)] bool fResume);
++
++    [DllImport("kernel32.dll", SetLastError = true)]
++    private static extern uint WaitForSingleObject(IntPtr hHandle, uint dwMilliseconds);
++}
+diff --git a/src/modules/MouseWithoutBorders/App/Core/RawPush.cs b/src/modules/MouseWithoutBorders/App/Core/RawPush.cs
+new file mode 100644
+index 0000000..ebf53c1
+--- /dev/null
++++ b/src/modules/MouseWithoutBorders/App/Core/RawPush.cs
+@@ -0,0 +1,340 @@
++// Copyright (c) Microsoft Corporation
++// The Microsoft Corporation licenses this file to you under the MIT license.
++// See the LICENSE file in the project root for more information.
++
++using System;
++using System.Diagnostics;
++using System.Runtime.InteropServices;
++using System.Threading;
++using System.Windows.Forms;
++
++using MouseWithoutBorders.Class;
++
++// <summary>
++//     Measures how hard the physical mouse is pushed while the cursor rests against a screen edge.
++//     The cursor position stops changing there, so this reads raw mouse input instead. Raw input is
++//     only registered while the cursor touches an edge (Arm) and is dropped a second after it moves away.
++// </summary>
++namespace MouseWithoutBorders.Core;
++
++internal static class RawPush
++{
++    private const int WM_INPUT = 0x00FF;
++    private const int WM_APP_REGISTER = 0x8001;
++    private const uint RIDEV_REMOVE = 0x00000001;
++    private const uint RIDEV_INPUTSINK = 0x00000100;
++    private const uint RID_INPUT = 0x10000003;
++    private const uint RIM_TYPEMOUSE = 0;
++    private const ushort MOUSE_MOVE_ABSOLUTE = 0x0001;
++    private const uint SPI_GETMOUSESPEED = 0x0070;
++    // Enough for a couple of seconds of 8 kHz input, so long rest times are still covered.
++    private const int Capacity = 32768;
++
++    // Windows pointer speed setting (1-20) to pixels per mouse count, without Enhance Pointer Precision.
++    private static readonly double[] PointerSpeedScale = { 0, 1 / 32.0, 1 / 16.0, 1 / 8.0, 2 / 8.0, 3 / 8.0, 4 / 8.0, 5 / 8.0, 6 / 8.0, 7 / 8.0, 1, 1.25, 1.5, 1.75, 2, 2.25, 2.5, 2.75, 3, 3.25, 3.5 };
++
++    private static readonly long IdleTicks = Stopwatch.Frequency; // unregister 1 s after the cursor left the edge
++
++    private static readonly object SyncLock = new();
++    private static readonly long[] Ticks = new long[Capacity];
++
++    // Running totals of the movement up to and including each sample, so any time range is two lookups.
++    private static readonly long[] SumX = new long[Capacity];
++    private static readonly long[] SumY = new long[Capacity];
++    private static long totalX;
++    private static long totalY;
++
++    // Totals before the oldest sample still kept.
++    private static long baseX;
++    private static long baseY;
++    private static int head;
++    private static int count;
++
++    private static int started;
++    private static long lastArmTicks;
++    private static long registeredSinceTicks;
++    private static int armX;
++    private static int armY;
++    private static volatile bool registered;
++    private static volatile IntPtr windowHandle;
++    private static double pixelsPerCount = 1;
++
++    // Last raw move seen by the window, before filtering; for diagnostics.
++    internal static int LastSeenDx { get; private set; }
++
++    internal static void Arm()
++    {
++        if (EdgePush.TryGetLatest(out int x, out int y))
++        {
++            armX = x;
++            armY = y;
++        }
++
++        Volatile.Write(ref lastArmTicks, Stopwatch.GetTimestamp());
++
++        if (Interlocked.Exchange(ref started, 1) == 0)
++        {
++            var thread = new System.Threading.Thread(Run) { IsBackground = true, Name = nameof(RawPush) };
++            thread.SetApartmentState(ApartmentState.STA);
++            Thread.UpdateThreads(thread);
++            thread.Start();
++        }
++        else if (!registered && windowHandle != IntPtr.Zero)
++        {
++            _ = NativeMethods.PostMessage(windowHandle, WM_APP_REGISTER, IntPtr.Zero, IntPtr.Zero);
++        }
++    }
++
++    // Physical mouse speed toward the edge over the last window, in (approximate) pixels per second.
++    internal static double SpeedToward(EdgeDirection edge, long windowTicks)
++    {
++        long now = Stopwatch.GetTimestamp();
++        return PixelsToward(edge, now - windowTicks, now) * Stopwatch.Frequency / windowTicks;
++    }
++
++    // Whether the mouse was (nearly) still toward the edge for restTicks before the last window,
++    // with raw input recorded for that whole time.
++    internal static bool WasStill(EdgeDirection edge, long windowTicks, long restTicks, double maxSpeed)
++    {
++        long end = Stopwatch.GetTimestamp() - windowTicks;
++        long start = end - restTicks;
++        long since = Volatile.Read(ref registeredSinceTicks);
++
++        if (!registered || since == 0 || since > start)
++        {
++            return false;
++        }
++
++        return PixelsToward(edge, start, end) <= maxSpeed * restTicks / Stopwatch.Frequency;
++    }
++
++    internal static string Describe(EdgeDirection edge, long windowTicks, long restTicks)
++    {
++        long now = Stopwatch.GetTimestamp();
++        long since = Volatile.Read(ref registeredSinceTicks);
++        double registeredMs = since == 0 ? -1 : (now - since) * 1000.0 / Stopwatch.Frequency;
++        double restPixels = PixelsToward(edge, now - windowTicks - restTicks, now - windowTicks);
++        return $"rawRegistered={registered} for {registeredMs:F0}ms rawSamples={count} restWindowPx={restPixels:F1}";
++    }
++
++    // Movement toward the edge between from (exclusive) and to (inclusive), in pixels.
++    private static double PixelsToward(EdgeDirection edge, long from, long to)
++    {
++        long sumX;
++        long sumY;
++
++        lock (SyncLock)
++        {
++            if (count == 0)
++            {
++                return 0;
++            }
++
++            int a = LastAtOrBefore(from);
++            int b = LastAtOrBefore(to);
++            sumX = TotalAt(SumX, baseX, b) - TotalAt(SumX, baseX, a);
++            sumY = TotalAt(SumY, baseY, b) - TotalAt(SumY, baseY, a);
++        }
++
++        long toward = edge switch
++        {
++            EdgeDirection.Left => -sumX,
++            EdgeDirection.Right => sumX,
++            EdgeDirection.Up => -sumY,
++            _ => sumY,
++        };
++
++        return toward * pixelsPerCount;
++    }
++
++    // Samples are in time order from the oldest (0) to the newest (count - 1).
++    private static int Physical(int logical) => (head - count + logical + Capacity) % Capacity;
++
++    // The newest sample at or before t, or -1 if every sample is later.
++    private static int LastAtOrBefore(long t)
++    {
++        int lo = 0;
++        int hi = count - 1;
++        int found = -1;
++
++        while (lo <= hi)
++        {
++            int mid = (lo + hi) / 2;
++
++            if (Ticks[Physical(mid)] <= t)
++            {
++                found = mid;
++                lo = mid + 1;
++            }
++            else
++            {
++                hi = mid - 1;
++            }
++        }
++
++        return found;
++    }
++
++    // Running total up to a sample; -1 means before the oldest sample still kept.
++    private static long TotalAt(long[] sums, long baseline, int logical) => logical >= 0 ? sums[Physical(logical)] : baseline;
++
++    internal static void Add(int dx, int dy)
++    {
++        lock (SyncLock)
++        {
++            // The oldest sample is about to be overwritten: the totals before the next oldest are its totals.
++            if (count == Capacity)
++            {
++                baseX = SumX[head];
++                baseY = SumY[head];
++            }
++
++            totalX += dx;
++            totalY += dy;
++            Ticks[head] = Stopwatch.GetTimestamp();
++            SumX[head] = totalX;
++            SumY[head] = totalY;
++            head = (head + 1) % Capacity;
++
++            if (count < Capacity)
++            {
++                count++;
++            }
++        }
++    }
++
++    private static void Run()
++    {
++        try
++        {
++            var window = new SinkWindow();
++            windowHandle = window.Handle;
++            Register(true);
++
++            using var timer = new System.Windows.Forms.Timer { Interval = 250 };
++            timer.Tick += (s, e) =>
++            {
++                // Stay registered while the cursor still sits where it last touched an edge, so a push after a long rest counts.
++                bool stillAtEdge = EdgePush.TryGetLatest(out int x, out int y) && x == armX && y == armY;
++
++                if (registered && !stillAtEdge && Stopwatch.GetTimestamp() - Volatile.Read(ref lastArmTicks) > IdleTicks)
++                {
++                    Register(false);
++                }
++            };
++            timer.Start();
++            Application.Run();
++        }
++        catch (Exception e)
++        {
++            Logger.Log(e);
++        }
++    }
++
++    private static void Register(bool enable)
++    {
++        if (enable)
++        {
++            int speed = 10;
++            _ = SystemParametersInfo(SPI_GETMOUSESPEED, 0, ref speed, 0);
++            pixelsPerCount = PointerSpeedScale[Math.Clamp(speed, 1, 20)];
++
++            lock (SyncLock)
++            {
++                count = 0;
++                baseX = totalX;
++                baseY = totalY;
++            }
++        }
++
++        var device = new RAWINPUTDEVICE
++        {
++            UsagePage = 0x01,
++            Usage = 0x02,
++            Flags = enable ? RIDEV_INPUTSINK : RIDEV_REMOVE,
++            Target = enable ? windowHandle : IntPtr.Zero,
++        };
++
++        if (RegisterRawInputDevices(new[] { device }, 1, (uint)Marshal.SizeOf<RAWINPUTDEVICE>()))
++        {
++            registered = enable;
++            Volatile.Write(ref registeredSinceTicks, enable ? Stopwatch.GetTimestamp() : 0);
++        }
++        else
++        {
++            Logger.Log($"{nameof(RawPush)}: RegisterRawInputDevices({enable}) failed: {Marshal.GetLastWin32Error()}");
++        }
++    }
++
++    private static unsafe void Read(IntPtr rawInput)
++    {
++        const int bufferSize = 64;
++        byte* buffer = stackalloc byte[bufferSize];
++        uint size = bufferSize;
++        uint headerSize = (uint)(8 + (2 * IntPtr.Size));
++
++        if (GetRawInputData(rawInput, RID_INPUT, (IntPtr)buffer, ref size, headerSize) == uint.MaxValue || *(uint*)buffer != RIM_TYPEMOUSE)
++        {
++            return;
++        }
++
++        // RAWINPUTHEADER { dwType, dwSize, hDevice, wParam }, then RAWMOUSE { usFlags, ulButtons, ulRawButtons, lLastX, lLastY, ... }.
++        IntPtr device = *(IntPtr*)(buffer + 8);
++        byte* mouse = buffer + headerSize;
++        int dx = *(int*)(mouse + 12);
++        int dy = *(int*)(mouse + 16);
++        LastSeenDx = dx;
++
++        // Skip injected input (no device, e.g. MWB's own SendInput) and absolute devices (tablets, remote desktop).
++        if (device == IntPtr.Zero || (*(ushort*)mouse & MOUSE_MOVE_ABSOLUTE) != 0 || (dx == 0 && dy == 0))
++        {
++            return;
++        }
++
++        Add(dx, dy);
++    }
++
++    private sealed class SinkWindow : NativeWindow
++    {
++        private static readonly IntPtr HWND_MESSAGE = new(-3);
++
++        internal SinkWindow()
++        {
++            CreateHandle(new CreateParams { Parent = HWND_MESSAGE });
++        }
++
++        protected override void WndProc(ref Message m)
++        {
++            if (m.Msg == WM_INPUT)
++            {
++                Read(m.LParam);
++            }
++            else if (m.Msg == WM_APP_REGISTER && !registered)
++            {
++                Register(true);
++            }
++
++            base.WndProc(ref m);
++        }
++    }
++
++    [StructLayout(LayoutKind.Sequential)]
++    private struct RAWINPUTDEVICE
++    {
++        internal ushort UsagePage;
++        internal ushort Usage;
++        internal uint Flags;
++        internal IntPtr Target;
++    }
++
++    [DllImport("user32.dll", SetLastError = true)]
++    [return: MarshalAs(UnmanagedType.Bool)]
++    private static extern bool RegisterRawInputDevices(RAWINPUTDEVICE[] devices, uint numDevices, uint size);
++
++    [DllImport("user32.dll")]
++    private static extern uint GetRawInputData(IntPtr rawInput, uint command, IntPtr data, ref uint size, uint headerSize);
++
++    [DllImport("user32.dll", SetLastError = true)]
++    [return: MarshalAs(UnmanagedType.Bool)]
++    private static extern bool SystemParametersInfo(uint action, uint param, ref int value, uint winIni);
++}
+diff --git a/src/modules/MouseWithoutBorders/App/Core/Tweaks.cs b/src/modules/MouseWithoutBorders/App/Core/Tweaks.cs
+new file mode 100644
+index 0000000..33ec5e1
+--- /dev/null
++++ b/src/modules/MouseWithoutBorders/App/Core/Tweaks.cs
+@@ -0,0 +1,129 @@
++// Copyright (c) Microsoft Corporation
++// The Microsoft Corporation licenses this file to you under the MIT license.
++// See the LICENSE file in the project root for more information.
++
++using System;
++using System.Collections.Generic;
++using System.Diagnostics;
++using System.Globalization;
++using System.IO;
++using System.Linq;
++using System.Threading;
++
++// <summary>
++//     Integer settings for the local MWB tweaks, read from %LOCALAPPDATA%\mwb8k\settings.ini (Key=Value, # comments).
++//     The file is checked for changes at most once a second, so edits apply without restarting.
++// </summary>
++namespace MouseWithoutBorders.Core;
++
++internal static class Tweaks
++{
++    // %LOCALAPPDATA%\mwb8k\settings.ini, found through the known folder, the environment, or next to the PowerToys folder.
++    private static readonly string[] Candidates = BuildCandidates();
++
++    private static Dictionary<string, int> values = new(StringComparer.OrdinalIgnoreCase);
++    private static DateTime loadedWriteTime = DateTime.MinValue;
++    private static long nextCheckTicks;
++    private static string lastStatus;
++
++    internal static int Get(string key, int defaultValue)
++    {
++        Refresh();
++        return values.TryGetValue(key, out int value) ? value : defaultValue;
++    }
++
++    private static void Refresh()
++    {
++        long now = Stopwatch.GetTimestamp();
++
++        if (now < Volatile.Read(ref nextCheckTicks))
++        {
++            return;
++        }
++
++        Volatile.Write(ref nextCheckTicks, now + Stopwatch.Frequency);
++
++        try
++        {
++            string filePath = Array.Find(Candidates, File.Exists);
++            DateTime writeTime = filePath != null ? File.GetLastWriteTimeUtc(filePath) : DateTime.MinValue;
++
++            if (filePath == null)
++            {
++                LogStatus("settings file not found, using defaults. Looked in: " + string.Join(" | ", Candidates));
++            }
++
++            if (writeTime == loadedWriteTime)
++            {
++                return;
++            }
++
++            var parsed = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
++
++            if (filePath != null)
++            {
++                foreach (string raw in File.ReadAllLines(filePath))
++                {
++                    string line = raw.Trim();
++                    int eq = line.IndexOf('=');
++
++                    if (line.StartsWith('#') || eq <= 0)
++                    {
++                        continue;
++                    }
++
++                    if (int.TryParse(line[(eq + 1)..].Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out int value))
++                    {
++                        parsed[line[..eq].Trim()] = value;
++                    }
++                }
++            }
++
++            values = parsed;
++            loadedWriteTime = writeTime;
++            LogStatus($"{filePath}: {string.Join(", ", parsed.Select(kv => kv.Key + "=" + kv.Value))}");
++        }
++        catch (Exception e)
++        {
++            // The settings window may be saving the file right now; try again on the next check.
++            LogStatus("couldn't read settings: " + e.GetType().Name + ": " + e.Message);
++        }
++    }
++
++    private static void LogStatus(string status)
++    {
++        if (status != lastStatus)
++        {
++            lastStatus = status;
++            Logger.Log($"{nameof(Tweaks)}: {status}");
++        }
++    }
++
++    private static string[] BuildCandidates()
++    {
++        var paths = new List<string>();
++
++        // The tools live in %LOCALAPPDATA%\Programs\mwb8k (older setups: %LOCALAPPDATA%\mwb8k).
++        void Add(string localAppData)
++        {
++            if (!string.IsNullOrEmpty(localAppData))
++            {
++                foreach (string path in new[] { Path.Combine(localAppData, "Programs", "mwb8k", "settings.ini"), Path.Combine(localAppData, "mwb8k", "settings.ini") })
++                {
++                    if (!paths.Contains(path, StringComparer.OrdinalIgnoreCase))
++                    {
++                        paths.Add(path);
++                    }
++                }
++            }
++        }
++
++        Add(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData));
++        Add(Environment.GetEnvironmentVariable("LOCALAPPDATA"));
++
++        // PowerToys is installed per user in %LOCALAPPDATA%\PowerToys.
++        string assemblyDir = Path.GetDirectoryName(typeof(Tweaks).Assembly.Location);
++        Add(string.IsNullOrEmpty(assemblyDir) ? null : Path.GetDirectoryName(assemblyDir));
++        return paths.ToArray();
++    }
++}

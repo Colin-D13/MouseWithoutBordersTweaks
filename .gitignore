@@ -1,0 +1,16 @@
+# Built or downloaded by apply.ps1 / dotnet build
+build/
+dotnet/
+dotnet-install.ps1
+bin/
+obj/
+out/
+*.exe
+
+# Local state
+settings.ini
+settings.ini.tmp
+autopatch.log
+disabled
+settings-backup/
+capture-off.reg

@@ -1,0 +1,41 @@
+{
+  "Actions": [
+    {
+      "Icon": "imgs/action",
+      "Name": "Game Lock",
+      "States": [
+        { "Name": "Lock on", "Image": "imgs/on", "TitleAlignment": "bottom", "FontSize": "9", "ShowTitle": false },
+        { "Name": "Lock off", "Image": "imgs/off", "TitleAlignment": "bottom", "FontSize": "9", "ShowTitle": false }
+      ],
+      "DisableAutomaticStates": true,
+      "SupportedInMultiActions": false,
+      "Controllers": [ "Keypad" ],
+      "Tooltip": "Stops Mouse Without Borders switching PCs while a fullscreen app is focused. Press to toggle.",
+      "UUID": "com.colin.mwbtoggle.gamelock"
+    },
+    {
+      "Icon": "imgs/action",
+      "Name": "PC Switch",
+      "States": [
+        { "Name": "Switching on", "Image": "imgs/switch-on", "TitleAlignment": "bottom", "FontSize": "9", "ShowTitle": false },
+        { "Name": "Switching off", "Image": "imgs/switch-off", "TitleAlignment": "bottom", "FontSize": "9", "ShowTitle": false }
+      ],
+      "DisableAutomaticStates": true,
+      "SupportedInMultiActions": false,
+      "Controllers": [ "Keypad" ],
+      "Tooltip": "Turns Mouse Without Borders' switching at screen edges (Easy Mouse) off entirely, and back on. Press to toggle.",
+      "UUID": "com.colin.mwbtoggle.switching"
+    }
+  ],
+  "SDKVersion": 2,
+  "Author": "colin",
+  "CodePath": "MwbToggle.exe",
+  "Description": "Keys for PowerToys Mouse Without Borders: Game Lock (no switching while a fullscreen app is focused) and PC Switch (edge switching on/off).",
+  "Name": "MWB Game Lock",
+  "Icon": "imgs/plugin",
+  "Version": "1.0.0",
+  "Category": "Mouse Without Borders",
+  "CategoryIcon": "imgs/category",
+  "OS": [ { "Platform": "windows", "MinimumVersion": "10" } ],
+  "Software": { "MinimumVersion": "6.0" }
+}

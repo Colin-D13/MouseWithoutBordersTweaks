@@ -1,0 +1,74 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Standalone rebuild of PowerToys.MouseWithoutBorders.dll against an installed PowerToys. Driven by apply.ps1. -->
+  <PropertyGroup>
+    <PTDir Condition="'$(PTDir)' == ''">$(LOCALAPPDATA)\PowerToys</PTDir>
+    <MwbTfm Condition="'$(MwbTfm)' == ''">net10.0-windows10.0.26100.0</MwbTfm>
+    <MwbVersion Condition="'$(MwbVersion)' == ''">0.101.2362.0</MwbVersion>
+    <MwbWinSdk Condition="'$(MwbWinSdk)' == ''">10.0.26100.68-preview</MwbWinSdk>
+    <MwbCsWinRT Condition="'$(MwbCsWinRT)' == ''">2.2.0</MwbCsWinRT>
+    <MwbGenDir Condition="'$(MwbGenDir)' == ''">$(MSBuildProjectDirectory)\..\gen\</MwbGenDir>
+    <MwbResDir Condition="'$(MwbResDir)' == ''">$(MSBuildProjectDirectory)\..\res</MwbResDir>
+
+    <TargetFramework>$(MwbTfm)</TargetFramework>
+    <WindowsSdkPackageVersion>$(MwbWinSdk)</WindowsSdkPackageVersion>
+    <TargetPlatformMinVersion>10.0.19041.0</TargetPlatformMinVersion>
+    <SupportedOSPlatformVersion>10.0.19041.0</SupportedOSPlatformVersion>
+    <Platforms>x64</Platforms>
+    <PlatformTarget>x64</PlatformTarget>
+    <OutputType>WinExe</OutputType>
+    <UseWindowsForms>true</UseWindowsForms>
+    <UseAppHost>false</UseAppHost>
+    <AssemblyName>PowerToys.MouseWithoutBorders</AssemblyName>
+    <RootNamespace>MouseWithoutBorders</RootNamespace>
+    <Version>$(MwbVersion)</Version>
+    <Company>Microsoft Corporation</Company>
+    <Product>PowerToys</Product>
+    <Copyright>Copyright (C) Microsoft Corporation. All rights reserved.</Copyright>
+    <NeutralLanguage>en-US</NeutralLanguage>
+    <DisableWinExeOutputInference>true</DisableWinExeOutputInference>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <NoWin32Manifest>true</NoWin32Manifest>
+    <Optimize>true</Optimize>
+    <DebugType>none</DebugType>
+    <DefineConstants>TRACE;SHOW_ON_WINLOGON CODE_ANALYSIS CUSTOMIZE_LOGON_SCREEN</DefineConstants>
+    <EnableNETAnalyzers>false</EnableNETAnalyzers>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <EnableDefaultEmbeddedResourceItems>false</EnableDefaultEmbeddedResourceItems>
+    <CsWinRTIncludes>PowerToys.GPOWrapper</CsWinRTIncludes>
+    <CsWinRTGeneratedFilesDir>$([MSBuild]::EnsureTrailingSlash('$(MwbGenDir)'))</CsWinRTGeneratedFilesDir>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <AssemblyAttribute Include="System.Runtime.InteropServices.ComVisible">
+      <_Parameter1>false</_Parameter1>
+      <_Parameter1_IsLiteral>true</_Parameter1_IsLiteral>
+    </AssemblyAttribute>
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Remove="Resources\**;Service\**;Helper\**;obj\**;bin\**" />
+    <Compile Remove="Control\Machine2.Designer.cs;Control\MachineMatrix.Designer.cs;Form\frmLogon.cs;Form\frmLogon.Designer.cs" />
+    <Compile Remove="Form\Settings\SettingsPage.Designer.cs;Form\Settings\SettingsPage1.Designer.cs;Form\Settings\SettingsPage2.Designer.cs;Form\Settings\SettingsPage3.Designer.cs;Form\Settings\SettingsPage4.Designer.cs" />
+    <None Remove="**" />
+    <!-- Original compiled resources, extracted byte-for-byte from the installed DLL. -->
+    <EmbeddedResource Include="$(MwbResDir)\*.resources" LogicalName="%(Filename)%(Extension)" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Windows.CsWinRT" Version="$(MwbCsWinRT)" />
+    <CsWinRTInputs Include="$(PTDir)\PowerToys.GPOWrapper.winmd" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="$(PTDir)\PowerToys.ManagedCommon.dll" Private="false" />
+    <Reference Include="$(PTDir)\PowerToys.ManagedTelemetry.dll" Private="false" />
+    <Reference Include="$(PTDir)\PowerToys.Settings.UI.Lib.dll" Private="false" />
+    <Reference Include="$(PTDir)\Newtonsoft.Json.dll" Private="false" />
+    <Reference Include="$(PTDir)\StreamJsonRpc.dll" Private="false" />
+    <Reference Include="$(PTDir)\Microsoft.VisualStudio.Threading.dll" Private="false" />
+    <Reference Include="$(PTDir)\Testably.Abstractions.FileSystem.Interface.dll" Private="false" />
+    <Reference Include="$(PTDir)\System.Diagnostics.EventLog.dll" Private="false" />
+    <Reference Include="$(PTDir)\System.ServiceProcess.ServiceController.dll" Private="false" />
+    <Reference Include="$(PTDir)\System.Security.Cryptography.ProtectedData.dll" Private="false" />
+  </ItemGroup>
+</Project>
