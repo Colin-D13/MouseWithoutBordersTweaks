@@ -6,6 +6,7 @@ bin/
 obj/
 out/
 *.exe
+*.exe.config
 
 # Local state
 settings.ini
