@@ -28,6 +28,12 @@ Settings live in `settings.ini` next to `apply.ps1` and are re-read within a sec
 | `MaxMouseMoveHz` | 500 | mouse updates per second sent to the other PC (0 = unlimited) |
 | `IgnoreRemoteInput` | 1 | 0 = MWB handles remote-desktop input like stock MWB does |
 
+## Setup with Claude Code
+- Open the repo in [Claude Code](https://claude.com/claude-code) and run `/mwb-setup` (in `.claude/skills/mwb-setup/`).
+  - It checks prerequisites, patches MWB, builds the tools, and can set up auto re-patching and the Stream Deck plugin.
+  - It asks before each change.
+- `CLAUDE.md` gives Claude the project layout, build steps and known gotchas.
+
 ## Install
 You need Windows 10/11, PowerToys (per-user install), Git and PowerShell 5.1.
 1. Clone the repo to `%LOCALAPPDATA%\Programs\mwb8k`. MWB looks for `settings.ini` there.

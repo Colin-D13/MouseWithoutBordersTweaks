@@ -15,3 +15,6 @@ autopatch.log
 disabled
 settings-backup/
 capture-off.reg
+
+# Claude Code per-user settings
+.claude/settings.local.json
